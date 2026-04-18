@@ -1,50 +1,49 @@
 # Gemma LiteRT API
 
-OpenAI-compatible API dla **Gemma 4 E2B** działający lokalnie przez [LiteRT-LM](https://ai.google.dev/edge/litert-lm). 
-Zoptymalizowany pod **ARM64** (Oracle Cloud Free Tier, Raspberry Pi, itp.) i **niskie zasoby**.
+OpenAI-compatible API server for **Gemma 4 E2B** running locally via [LiteRT-LM](https://ai.google.dev/edge/litert-lm).  
+Optimized for **ARM64** (Oracle Cloud Free Tier, Raspberry Pi, etc.) and **low resource** environments.
 
-Używa oficjalnego [Python API LiteRT-LM](https://ai.google.dev/edge/litert-lm/python) — model ładuje się raz do pamięci i pozostaje tam, co zapewnia szybkie odpowiedzi.
+Uses the official [LiteRT-LM Python API](https://ai.google.dev/edge/litert-lm/python) — the model loads once into memory and stays there, ensuring fast responses on every request.
 
-## ✨ Funkcje
+## ✨ Features
 
-- **OpenAI-compatible** — drop-in replacement dla klientów OpenAI SDK
-- **Dwa formaty API**:
-  - `/v1/chat/completions` — klasyczne OpenAI
-  - `/v1/responses` — nowe OpenAI (używane przez n8n AI Agent, LangChain)
-- **Streaming (SSE)** — działa w obu endpointach
-- **Lekki** — debian:12-slim + FastAPI + uvicorn
-- **ARM64 ready** — testowane na Oracle Cloud Ampere A1
+- **OpenAI-compatible** — drop-in replacement for OpenAI SDK clients
+- **Two API formats**:
+  - `/v1/chat/completions` — classic OpenAI Chat API
+  - `/v1/responses` — new OpenAI Responses API (used by n8n AI Agent, LangChain)
+- **Streaming (SSE)** — supported in both endpoints
+- **Lightweight** — debian:12-slim + FastAPI + uvicorn
+- **ARM64 ready** — tested on Oracle Cloud Ampere A1
 
-## 🚀 Szybki start (Docker)
+## 🚀 Quick Start
 
-### 1. Pobierz model
+### 1. Download the model
 
-Na hoście (wymaga Python):
+On the host machine:
 
 ```bash
 pip install huggingface_hub --break-system-packages
-# Nowsza wersja używa polecenia 'hf'
 hf download litert-community/gemma-4-E2B-it-litert-lm \
   gemma-4-E2B-it.litertlm \
   --local-dir /opt/models/
 ```
 
-Sprawdź czy plik się pobrał (~2.5 GB):
+Verify the file (~2.5 GB):
 
 ```bash
 ls -lh /opt/models/
 ```
 
-### 2. Uruchom przez docker-compose
+### 2. Run with docker-compose
 
 ```bash
-git clone https://github.com/leonidas300/gemma-litert-api
+git clone https://github.com/YOUR_USERNAME/gemma-litert-api
 cd gemma-litert-api
 docker compose up -d
 ```
 
-Pierwsze budowanie trwa 5-10 minut (pobiera zależności Python).  
-Model ładuje się do pamięci ~30-60 sekund po starcie kontenera.
+First build takes 5–10 minutes (downloads Python dependencies).  
+The model loads into memory ~30–60 seconds after container start.
 
 ### 3. Test
 
@@ -54,45 +53,45 @@ curl http://localhost:3008/v1/chat/completions \
   -H "Authorization: Bearer sk-local" \
   -d '{
     "model": "gemma-4-e2b",
-    "messages": [{"role": "user", "content": "Cześć!"}]
+    "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
 
-## 🔧 Deployment przez Portainer
+## 🔧 Portainer Deployment
 
 **Stacks → Add stack → Repository**
 
-- **Repository URL:** `https://github.com/leonidas300/gemma-litert-api`
+- **Repository URL:** `https://github.com/YOUR_USERNAME/gemma-litert-api`
 - **Repository reference:** `refs/heads/main`
 - **Compose path:** `docker-compose.yml`
 
-Kliknij **Deploy the stack**.
+Click **Deploy the stack**.
 
-## 📡 Integracja z n8n
+## 📡 n8n Integration
 
-W n8n dodaj credentials **OpenAI API** z własnym endpointem:
+Add **OpenAI API** credentials in n8n:
 
-- **Base URL:** `http://litert:3000/v1` (jeśli n8n w tej samej sieci Docker)  
-  lub `http://IP_HOSTA:3008/v1`
+- **Base URL:** `http://litert:3000/v1` (if n8n is in the same Docker network)  
+  or `http://HOST_IP:3008/v1`
 - **API Key:** `sk-local`
 - **Model:** `gemma-4-e2b`
 
-Działa z **AI Agent**, **Chat Model**, **HTTP Request** i innymi node'ami.
+Works with **AI Agent**, **Chat Model**, **HTTP Request** and other nodes.
 
-## ⚙️ Konfiguracja
+## ⚙️ Configuration
 
-Zmienne środowiskowe (w `docker-compose.yml`):
+Environment variables (set in `docker-compose.yml`):
 
-| Zmienna | Domyślna | Opis |
+| Variable | Default | Description |
 |---|---|---|
-| `MODEL_PATH` | `/models/gemma-4-E2B-it.litertlm` | Ścieżka do modelu w kontenerze |
-| `API_KEY` | `sk-local` | Klucz API (ustaw coś mocniejszego w produkcji) |
-| `MODEL_ID` | `gemma-4-e2b` | ID modelu zwracane w API |
-| `PORT` | `3000` | Port wewnątrz kontenera |
+| `MODEL_PATH` | `/models/gemma-4-E2B-it.litertlm` | Path to the model inside the container |
+| `API_KEY` | `sk-local` | API key for Bearer authentication |
+| `MODEL_ID` | `gemma-4-e2b` | Model ID returned by the API |
+| `PORT` | `3000` | Internal container port |
 
-## 📊 Limity zasobów
+## 📊 Resource Usage
 
-Domyślnie brak limitów. Jeśli chcesz ograniczyć CPU/RAM, dodaj do `docker-compose.yml`:
+No limits set by default. To restrict CPU/RAM, add to `docker-compose.yml`:
 
 ```yaml
 deploy:
@@ -102,23 +101,22 @@ deploy:
       memory: 8G
 ```
 
-Sam model zużywa ~3 GB RAM, generowanie obciąża CPU.
+The model itself uses ~3 GB RAM. Generation is CPU-intensive.
 
-## 🛠️ API Endpointy
+## 🛠️ API Endpoints
 
-| Metoda | Ścieżka | Opis |
+| Method | Path | Description |
 |---|---|---|
-| `GET`  | `/health` | Status serwera |
-| `GET`  | `/v1/models` | Lista dostępnych modeli |
-| `POST` | `/v1/chat/completions` | Chat completions (klasyczne OpenAI) |
-| `POST` | `/v1/responses` | Responses API (nowe OpenAI) |
+| `GET`  | `/health` | Server health check |
+| `GET`  | `/v1/models` | List available models |
+| `POST` | `/v1/chat/completions` | Chat completions (classic OpenAI) |
+| `POST` | `/v1/responses` | Responses API (new OpenAI format) |
 
-## 📝 Licencja
+## 📝 License
 
 MIT
 
-## 🙏 Podziękowania
+## 🙏 Acknowledgements
 
-- [Google AI Edge](https://github.com/google-ai-edge/LiteRT-LM) — LiteRT-LM
-- [Gemma](https://ai.google.dev/gemma) — modele od Google DeepMind
-- Inspirowane [imertz/litert-lm-api-server](https://github.com/imertz/litert-lm-api-server)
+- [Google AI Edge](https://github.com/google-ai-edge/LiteRT-LM) — LiteRT-LM framework
+- [Gemma](https://ai.google.dev/gemma) — models by Google DeepMind
