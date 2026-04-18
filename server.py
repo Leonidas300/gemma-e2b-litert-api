@@ -349,7 +349,7 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
                         "id": tc_id, "type": "function",
                         "function": {
                             "name": tool_call["name"],
-                            "arguments": json.dumps(tool_call["arguments"])
+                            "arguments": json.dumps(tool_call["arguments"]),
                             "content": None
                         }
                     }]
@@ -462,7 +462,7 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
                 "id": call_id, "type": "function_call", "status": "completed",
                 "call_id": call_id,
                 "name": tool_call["name"],
-                "arguments": json.dumps(tool_call["arguments"])
+                "arguments": json.dumps(tool_call["arguments"]),
               "content": None
             }],
             "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
