@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Any
 
 import litert_lm
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
