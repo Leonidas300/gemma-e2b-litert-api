@@ -1,0 +1,14 @@
+services:
+  gemma-api:
+    build: .
+    container_name: litert         # ta sama nazwa co wczesniej - n8n juz jest skonfigurowane
+    restart: unless-stopped
+    ports:
+      - "3008:3000"
+    volumes:
+      - /opt/models/gemma-4-E2B-it.litertlm:/models/gemma-4-E2B-it.litertlm:ro
+    environment:
+      MODEL_PATH: /models/gemma-4-E2B-it.litertlm
+      API_KEY: sk-local
+      MODEL_ID: gemma-4-e2b
+      PORT: "3000"
