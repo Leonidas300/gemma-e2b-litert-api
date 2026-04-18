@@ -30,6 +30,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pydantic import model_validator
 
 # ── Configuration ────────────────────────────────────────────
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/gemma-4-E2B-it.litertlm")
@@ -90,6 +91,17 @@ class ChatRequest(BaseModel):
     tools: Optional[list] = None
     tool_choice: Optional[Any] = None
 
+    @model_validator(mode='after')
+    def clean_tools(self):
+        if self.tools:
+            for tool in self.tools:
+                if isinstance(tool, dict):
+                    tool.pop("strict", None)
+                    fn = tool.get("function", {})
+                    if isinstance(fn, dict):
+                        fn.pop("strict", None)
+        return self
+
 class ResponsesRequest(BaseModel):
     model: Optional[str] = MODEL_ID
     input: Any
@@ -97,7 +109,17 @@ class ResponsesRequest(BaseModel):
     tools: Optional[list] = None
     instructions: Optional[str] = None
     tool_choice: Optional[Any] = None
-
+  
+@model_validator(mode='after')
+def clean_tools(self):
+    if self.tools:
+        for tool in self.tools:
+            if isinstance(tool, dict):
+                tool.pop("strict", None)
+                fn = tool.get("function", {})
+                if isinstance(fn, dict):
+                    fn.pop("strict", None)
+    return self
 # ── Helpers ───────────────────────────────────────────────────
 def message_content_to_text(content: Any) -> str:
     """Extract plain text from content field (string or list)."""
