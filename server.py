@@ -435,74 +435,32 @@ async def chat_stream_generator(request_id, created, init_messages, prompt_text)
 
 # ── /v1/responses ─────────────────────────────────────────────
 @app.post("/v1/responses")
-async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
-  #@app.post("/v1/responses")
-  #async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
-    #log.info(f"RESPONSES INPUT: {req.model_dump_json()}")
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
+async def responses_endpoint(req: Request, _=Depends(verify_key)):
+    body = await req.json()
+    
+    # Przetłumacz input → messages
     messages = []
-    if req.instructions:
-        messages.append(Message(role="system", content=req.instructions))
-
-    if isinstance(req.input, str):
-        messages.append(Message(role="user", content=req.input))
-    elif isinstance(req.input, list):
-        for item in req.input:
-            if isinstance(item, dict):
-                messages.append(Message(
-                    role=item.get("role", "user"),
-                    content=item.get("content", ""),
-                    tool_calls=item.get("tool_calls"),
-                    name=item.get("name"),
-                    tool_call_id=item.get("tool_call_id"),
-                ))
-
-    init_messages, prompt_text = build_litertlm_messages(messages, req.tools)
-    response_id = f"resp_{uuid.uuid4().hex[:24]}"
-    created = int(time.time())
-
-    if req.stream and not req.tools:
-        return StreamingResponse(
-            responses_stream_generator(response_id, created, init_messages, prompt_text),
-            media_type="text/event-stream",
-        )
-
-    loop = asyncio.get_event_loop()
-    try:
-        full_text = await loop.run_in_executor(None, run_generation, init_messages, prompt_text)
-    except Exception as e:
-        log.error(f"Generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    tool_call = parse_tool_call(full_text) if req.tools else None
-
-    if tool_call:
-        call_id = f"call_{uuid.uuid4().hex[:24]}"
-        return JSONResponse({
-            "id": response_id, "object": "response", "created_at": created,
-            "status": "completed", "model": MODEL_ID,
-            "output": [{
-                "id": call_id, "type": "function_call", "status": "completed",
-                "call_id": call_id,
-                "name": tool_call["name"],
-                "arguments": json.dumps(tool_call["arguments"]),
-                "content": None
-            }],
-            "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
-        })
-
-    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-    return JSONResponse({
-        "id": response_id, "object": "response", "created_at": created,
-        "status": "completed", "model": MODEL_ID,
-        "output": [{
-            "id": msg_id, "type": "message", "role": "assistant", "status": "completed",
-            "content": [{"type": "output_text", "text": full_text, "annotations": []}]
-        }],
-        "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
-    })
+    if "instructions" in body:
+        messages.append({"role": "system", "content": body["instructions"]})
+    
+    input_data = body.get("input", "")
+    if isinstance(input_data, str):
+        messages.append({"role": "user", "content": input_data})
+    elif isinstance(input_data, list):
+        for item in input_data:
+            messages.append({"role": item.get("role", "user"), "content": item.get("content", "")})
+    
+    # Przekaż do chat/completions
+    chat_body = {
+        "model": body.get("model", MODEL_ID),
+        "messages": messages,
+        "stream": body.get("stream", False),
+        "tools": body.get("tools"),
+    }
+    
+    # Użyj istniejącej logiki chat/completions
+    chat_req = ChatRequest(**{k: v for k, v in chat_body.items() if v is not None})
+    return await chat_completions(chat_req, None)
 
 async def responses_stream_generator(response_id, created, init_messages, prompt_text):
     """SSE stream for Responses API."""
