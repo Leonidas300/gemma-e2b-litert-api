@@ -344,7 +344,7 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": "",
+                    "content": None,
                     "tool_calls": [{
                         "id": tc_id, "type": "function",
                         "function": {
