@@ -466,7 +466,7 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
                 "call_id": call_id,
                 "name": tool_call["name"],
                 "arguments": json.dumps(tool_call["arguments"]),
-              "content": []
+                "content": []
             }],
             "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
         })
