@@ -414,9 +414,9 @@ async def chat_stream_generator(request_id, created, init_messages, prompt_text)
 # ── /v1/responses ─────────────────────────────────────────────
 @app.post("/v1/responses")
 async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
-  @app.post("/v1/responses")
-  async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
-    log.info(f"RESPONSES INPUT: {req.model_dump_json()}")
+  #@app.post("/v1/responses")
+  #async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
+    #log.info(f"RESPONSES INPUT: {req.model_dump_json()}")
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
