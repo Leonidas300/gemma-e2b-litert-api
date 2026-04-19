@@ -11,7 +11,6 @@ Tool calling:
   Gemma 4 emits native tool calls using:
     <|tool_call>call:function_name{param:<|"|>value<|"|>}<tool_call|>
   We parse this format and convert to OpenAI tool_calls format.
-  Also handles n8n's non-standard tool format (no "function" wrapper).
 """
 
 import os
@@ -51,7 +50,6 @@ async def lifespan(app: FastAPI):
     if not os.path.exists(MODEL_PATH):
         log.error(f"Model not found: {MODEL_PATH}")
         raise RuntimeError(f"Model not found: {MODEL_PATH}")
-
     engine = litert_lm.Engine(MODEL_PATH, backend=litert_lm.Backend.CPU)
     log.info("Model loaded successfully ✓")
     yield
@@ -63,7 +61,7 @@ async def lifespan(app: FastAPI):
     log.info("Engine closed")
 
 # ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(title="Gemma 4 E2B API", version="5.1.0", lifespan=lifespan)
+app = FastAPI(title="Gemma 4 E2B API", version="5.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Auth ──────────────────────────────────────────────────────
@@ -103,8 +101,9 @@ def normalize_tools(tools: Optional[list]) -> Optional[list]:
     """
     Normalize tool format. n8n sends tools without "function" wrapper:
       {"type": "function", "name": "...", "parameters": {...}}
-    OpenAI format has wrapper:
+    OpenAI format:
       {"type": "function", "function": {"name": "...", "parameters": {...}}}
+    Also filters out n8n internal tools.
     """
     if not tools:
         return None
@@ -113,9 +112,8 @@ def normalize_tools(tools: Optional[list]) -> Optional[list]:
         if not isinstance(t, dict):
             continue
         # Skip n8n internal tools
-        if t.get("name") == "format_final_json_response":
-            continue
-        if t.get("function", {}).get("name") == "format_final_json_response":
+        name_check = t.get("name") or t.get("function", {}).get("name", "")
+        if name_check == "format_final_json_response":
             continue
         # n8n format: no "function" wrapper
         if "name" in t and "function" not in t:
@@ -136,10 +134,10 @@ def parse_gemma4_tool_calls(text: str) -> Optional[list]:
     """
     Parse Gemma 4 native tool call format:
       <|tool_call>call:function_name{param:<|"|>value<|"|>}<tool_call|>
+    Returns list of OpenAI-compatible tool_calls or None.
     """
     pattern = r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>'
     matches = re.findall(pattern, text, re.DOTALL)
-
     if not matches:
         return None
 
@@ -152,11 +150,9 @@ def parse_gemma4_tool_calls(text: str) -> Optional[list]:
             arguments = json.loads(args_str)
         except json.JSONDecodeError:
             arguments = {}
-            kv_pattern = r'(\w+):"([^"]*)"'
-            for k, v in re.findall(kv_pattern, args_str):
+            for k, v in re.findall(r'(\w+):"([^"]*)"', args_str):
                 arguments[k] = v
-            kv_pattern2 = r'(\w+):([\d.]+|true|false|null)'
-            for k, v in re.findall(kv_pattern2, args_str):
+            for k, v in re.findall(r'(\w+):([\d.]+|true|false|null)', args_str):
                 if v == 'true':
                     arguments[k] = True
                 elif v == 'false':
@@ -181,12 +177,11 @@ def parse_gemma4_tool_calls(text: str) -> Optional[list]:
     return tool_calls if tool_calls else None
 
 def extract_text_without_tool_calls(text: str) -> str:
-    """Remove Gemma 4 tool call blocks from text."""
     pattern = r'<\|tool_call>.*?<tool_call\|>'
     return re.sub(pattern, '', text, flags=re.DOTALL).strip()
 
 def parse_tool_call_legacy(text: str) -> Optional[dict]:
-    """Legacy JSON-based tool call parser."""
+    """Legacy JSON-based tool call parser (fallback)."""
     text = text.strip()
     try:
         data = json.loads(text)
@@ -255,9 +250,14 @@ def build_tools_system_prompt(tools: list) -> str:
         return ""
 
     lines = ["You have access to the following tools:\n"]
+    first_tool_name = None
+    first_tool_param = None
+
     for t in tools:
         fn = t.get("function", t)
         name = fn.get("name", "")
+        if not first_tool_name:
+            first_tool_name = name
         desc = fn.get("description", "")
         params = fn.get("parameters", {})
         props = params.get("properties", {}) if isinstance(params, dict) else {}
@@ -265,15 +265,22 @@ def build_tools_system_prompt(tools: list) -> str:
 
         lines.append(f"- {name}: {desc}")
         for pname, pinfo in props.items():
+            if not first_tool_param:
+                first_tool_param = pname
             ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
             pdesc = pinfo.get("description", "") if isinstance(pinfo, dict) else ""
             req = " (required)" if pname in required else ""
             lines.append(f"    - {pname} ({ptype}){req}: {pdesc}")
 
-    lines.append("""
-When you need to call a tool, use this exact format:
-<|tool_call>call:tool_name{<|"|>param<|"|>:<|"|>value<|"|>}<tool_call|>
+    # Build example using real tool name and param
+    example_name = first_tool_name or "tool_name"
+    example_param = first_tool_param or "param"
 
+    lines.append(f"""
+When you need to call a tool, respond with ONLY this format (nothing before or after):
+<|tool_call>call:{example_name}{{<|"|>{example_param}<|"|>:<|"|>value<|"|>}}<tool_call|>
+
+Use the exact tool name and parameter names from the list above.
 If you don't need a tool, respond normally in plain text.""")
 
     return "\n".join(lines)
@@ -303,8 +310,15 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tup
                         args = json.loads(args)
                     except:
                         pass
-                args_gemma = json.dumps(args).replace('"', '<|"|>')
-                calls_text.append(f'<|tool_call>call:{name}{args_gemma}<tool_call|>')
+                # Convert args to Gemma 4 format
+                if isinstance(args, dict):
+                    args_parts = []
+                    for k, v in args.items():
+                        args_parts.append(f'<|"|>{k}<|"|>:<|"|>{v}<|"|>')
+                    args_str = '{' + ','.join(args_parts) + '}'
+                else:
+                    args_str = str(args)
+                calls_text.append(f'<|tool_call>call:{name}{args_str}<tool_call|>')
             text = "\n".join(calls_text) if calls_text else text
 
         if role == "system":
