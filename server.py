@@ -488,7 +488,8 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
     except Exception as e:
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
+      
+    log.info(f"TOOLS RECEIVED: {json.dumps(req.tools, default=str)[:300] if req.tools else 'NONE'}")
     log.info(f"MODEL OUTPUT (responses): {full_text[:300]}")
 
     if req.tools:
