@@ -76,7 +76,8 @@ Add **OpenAI API** credentials in n8n:
 - **API Key:** `sk-local`
 - **Model:** `gemma-4-e2b`
 
-Works with **AI Agent**, **Chat Model**, **HTTP Request** and other nodes.
+Works with **AI Agent**, **Chat Model**, **HTTP Request** and other nodes. 
+If you want to use tool than in n8n you need to import this agent https://github.com/fjrdomingues/n8n-nodes-better-ai-agent.git
 
 ## ⚙️ Configuration
 
