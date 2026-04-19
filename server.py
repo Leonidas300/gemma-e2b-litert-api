@@ -518,10 +518,19 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
         native_tool_calls = parse_gemma4_tool_calls(full_text)
         if native_tool_calls:
             log.info(f"Native tool calls in responses: {[tc['function']['name'] for tc in native_tool_calls]}")
+            empty_msg_id = f"msg_{uuid.uuid4().hex[:24]}"
             return JSONResponse({
                 "id": response_id, "object": "response", "created_at": created,
                 "status": "completed", "model": MODEL_ID,
-                "output": [{
+                "output": [
+                    {
+                        "id": empty_msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": []
+                    }
+                ] + [{
                     "id": tc["id"], "type": "function_call", "status": "completed",
                     "call_id": tc["id"],
                     "name": tc["function"]["name"],
