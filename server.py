@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Any
 
 import litert_lm
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
     log.info("Engine closed")
 
 # ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(title="Gemma 4 E2B API", version="3.2.0", lifespan=lifespan)
+app = FastAPI(title="Gemma 4 E2B API", version="3.3.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Auth ──────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ class Message(BaseModel):
     name: Optional[str] = None
 
 def _clean_tools(tools):
-    """Remove null 'strict' field n8n sends that breaks validation."""
+    """Remove null 'strict' field that n8n sends and which breaks validation."""
     if not tools:
         return tools
     for tool in tools:
@@ -94,6 +94,19 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = 1024
     temperature: Optional[float] = 1.0
     tools: Optional[list] = None
+    tool_choice: Optional[Any] = None
+
+    @model_validator(mode='after')
+    def _clean(self):
+        self.tools = _clean_tools(self.tools)
+        return self
+
+class ResponsesRequest(BaseModel):
+    model: Optional[str] = MODEL_ID
+    input: Any
+    stream: Optional[bool] = False
+    tools: Optional[list] = None
+    instructions: Optional[str] = None
     tool_choice: Optional[Any] = None
 
     @model_validator(mode='after')
@@ -404,22 +417,18 @@ async def chat_stream_generator(request_id, created, init_messages, prompt_text)
 
 # ── /v1/responses ─────────────────────────────────────────────
 @app.post("/v1/responses")
-async def responses_endpoint(req: Request, _=Depends(verify_key)):
+async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    body = await req.json()
-
-    # Build messages from input + instructions
     messages = []
-    if body.get("instructions"):
-        messages.append(Message(role="system", content=body["instructions"]))
+    if req.instructions:
+        messages.append(Message(role="system", content=req.instructions))
 
-    input_data = body.get("input", "")
-    if isinstance(input_data, str):
-        messages.append(Message(role="user", content=input_data))
-    elif isinstance(input_data, list):
-        for item in input_data:
+    if isinstance(req.input, str):
+        messages.append(Message(role="user", content=req.input))
+    elif isinstance(req.input, list):
+        for item in req.input:
             if isinstance(item, dict):
                 messages.append(Message(
                     role=item.get("role", "user"),
@@ -429,8 +438,7 @@ async def responses_endpoint(req: Request, _=Depends(verify_key)):
                     tool_call_id=item.get("tool_call_id"),
                 ))
 
-    tools = _clean_tools(body.get("tools"))
-    init_messages, prompt_text = build_litertlm_messages(messages, tools)
+    init_messages, prompt_text = build_litertlm_messages(messages, req.tools)
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
@@ -441,7 +449,7 @@ async def responses_endpoint(req: Request, _=Depends(verify_key)):
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    tool_call = parse_tool_call(full_text) if tools else None
+    tool_call = parse_tool_call(full_text) if req.tools else None
 
     if tool_call:
         call_id = f"call_{uuid.uuid4().hex[:24]}"
