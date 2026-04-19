@@ -7,15 +7,10 @@ Endpoints:
   POST /v1/chat/completions  (classic OpenAI + tool calling)
   POST /v1/responses         (new OpenAI Responses API + tool calling)
 
-Tool calling strategy:
-  Prompt-engineering fallback. The model is instructed to output a specific
-  JSON format when it wants to call a tool. The server parses this output
-  and converts it into OpenAI's native tool_calls format so clients
-  (n8n AI Agent, LangChain, etc.) can use it transparently.
-
-  Special handling for n8n V3 Agent's internal tool: format_final_json_response.
-  When the model calls this tool, we extract the output and return it as a
-  normal text response — n8n uses this tool to format final answers.
+Tool calling:
+  Gemma 4 emits native tool calls using:
+    <|tool_call>call:function_name{param:<|"|>value<|"|>}<tool_call|>
+  We parse this format and convert to OpenAI tool_calls format.
 """
 
 import os
@@ -67,7 +62,7 @@ async def lifespan(app: FastAPI):
     log.info("Engine closed")
 
 # ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(title="Gemma 4 E2B API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Gemma 4 E2B API", version="5.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Auth ──────────────────────────────────────────────────────
@@ -102,70 +97,76 @@ class ResponsesRequest(BaseModel):
     instructions: Optional[str] = None
     tool_choice: Optional[Any] = None
 
-# ── Helpers ───────────────────────────────────────────────────
-def message_content_to_text(content: Any) -> str:
-    """Extract plain text from content field (string or list)."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("type") in ("text", "input_text", "output_text"):
-                    parts.append(item.get("text", ""))
-                elif "text" in item:
-                    parts.append(item["text"])
-            elif isinstance(item, str):
-                parts.append(item)
-        return " ".join(parts)
-    return str(content)
+# ── Gemma 4 native tool call parser ──────────────────────────
+def parse_gemma4_tool_calls(text: str) -> Optional[list]:
+    """
+    Parse Gemma 4 native tool call format:
+      <|tool_call>call:function_name{param:<|"|>value<|"|>}<tool_call|>
+    
+    Returns list of OpenAI-compatible tool_calls or None if no tool calls found.
+    """
+    # Find all tool call blocks
+    pattern = r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>'
+    matches = re.findall(pattern, text, re.DOTALL)
+    
+    if not matches:
+        return None
+    
+    tool_calls = []
+    for func_name, args_str in matches:
+        # Parse arguments - Gemma 4 uses <|"|> for string escaping
+        # Replace Gemma's string escapes with proper quotes
+        args_str = args_str.replace('<|"|>', '"')
+        
+        # Try to parse as JSON object
+        try:
+            # Wrap in braces if needed
+            if not args_str.strip().startswith('{'):
+                args_str = '{' + args_str + '}'
+            arguments = json.loads(args_str)
+        except json.JSONDecodeError:
+            # Try to parse key:value pairs manually
+            arguments = {}
+            # Pattern: key:<|"|>value<|"|> or key:value
+            kv_pattern = r'(\w+):"([^"]*)"'
+            kv_matches = re.findall(kv_pattern, args_str)
+            for k, v in kv_matches:
+                arguments[k] = v
+            # Also try numeric/boolean values
+            kv_pattern2 = r'(\w+):([\d.]+|true|false|null)'
+            kv_matches2 = re.findall(kv_pattern2, args_str)
+            for k, v in kv_matches2:
+                if v == 'true':
+                    arguments[k] = True
+                elif v == 'false':
+                    arguments[k] = False
+                elif v == 'null':
+                    arguments[k] = None
+                else:
+                    try:
+                        arguments[k] = float(v) if '.' in v else int(v)
+                    except ValueError:
+                        arguments[k] = v
 
-def build_tools_prompt(tools: list) -> str:
-    """Build a system prompt describing available tools."""
-    if not tools:
-        return ""
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": json.dumps(arguments)
+            }
+        })
+    
+    return tool_calls if tool_calls else None
 
-    tool_descriptions = []
-    for t in tools:
-        fn = t.get("function", t) if isinstance(t, dict) else t
-        name = fn.get("name", "unknown")
-        # Skip n8n internal tools from description
-        if name == "format_final_json_response":
-            continue
-        desc = fn.get("description", "")
-        params = fn.get("parameters", {})
-        props = params.get("properties", {}) if isinstance(params, dict) else {}
-        required = params.get("required", []) if isinstance(params, dict) else []
+def extract_text_without_tool_calls(text: str) -> str:
+    """Remove Gemma 4 tool call blocks from text."""
+    pattern = r'<\|tool_call>.*?<tool_call\|>'
+    cleaned = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    return cleaned
 
-        param_lines = []
-        for pname, pinfo in props.items():
-            ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
-            pdesc = pinfo.get("description", "") if isinstance(pinfo, dict) else ""
-            req = " (required)" if pname in required else ""
-            param_lines.append(f"    - {pname} ({ptype}){req}: {pdesc}")
-
-        params_str = "\n".join(param_lines) if param_lines else "    (no parameters)"
-        tool_descriptions.append(f"- {name}: {desc}\n  Parameters:\n{params_str}")
-
-    if not tool_descriptions:
-        return ""
-
-    tools_text = "\n".join(tool_descriptions)
-
-    return f"""You have access to the following tools:
-
-{tools_text}
-
-IMPORTANT — When you need to call a tool, respond with ONLY a JSON object in this exact format (no other text before or after):
-{{"tool_call": {{"name": "tool_name", "arguments": {{"param1": "value1"}}}}}}
-
-If you do NOT need to call a tool, respond normally in plain text.
-After a tool is called and you receive its result, continue the conversation normally using that information."""
-
-def parse_tool_call(text: str) -> Optional[dict]:
-    """Try to parse a tool call from the model's raw output."""
+def parse_tool_call_legacy(text: str) -> Optional[dict]:
+    """Legacy JSON-based tool call parser (prompt engineering fallback)."""
     text = text.strip()
 
     try:
@@ -216,89 +217,28 @@ def parse_tool_call(text: str) -> Optional[dict]:
 
     return None
 
-def extract_format_final_response(text: str) -> Optional[str]:
-    """
-    n8n V3 Agent adds 'format_final_json_response' tool internally.
-    When the model calls it, extract the 'output' field and return as plain text.
-    """
-    text = text.strip()
+# ── Helpers ───────────────────────────────────────────────────
+def message_content_to_text(content: Any) -> str:
+    """Extract plain text from content field (string or list)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in ("text", "input_text", "output_text"):
+                    parts.append(item.get("text", ""))
+                elif "text" in item:
+                    parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(parts)
+    return str(content)
 
-    # Try to find tool_call with name format_final_json_response
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "tool_call" in data:
-            tc = data["tool_call"]
-            if tc.get("name") == "format_final_json_response":
-                args = tc.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except:
-                        pass
-                return args.get("output", str(args))
-    except json.JSONDecodeError:
-        pass
-
-    # Search in raw text
-    patterns = [
-        r'```json\s*(\{.*?\})\s*```',
-        r'```\s*(\{.*?\})\s*```',
-    ]
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.DOTALL)
-        for match in matches:
-            try:
-                data = json.loads(match)
-                if isinstance(data, dict) and "tool_call" in data:
-                    tc = data["tool_call"]
-                    if tc.get("name") == "format_final_json_response":
-                        args = tc.get("arguments", {})
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except:
-                                pass
-                        return args.get("output", str(args))
-            except json.JSONDecodeError:
-                continue
-
-    return None
-
-def has_n8n_format_tool(tools: Optional[list]) -> bool:
-    """Check if n8n injected its format_final_json_response tool."""
-    if not tools:
-        return False
-    return any(
-        (t.get("function", t) if isinstance(t, dict) else t).get("name") == "format_final_json_response"
-        for t in tools
-    )
-
-def build_n8n_system_prompt(tools: Optional[list]) -> str:
-    """
-    Build system prompt for n8n V3 Agent mode.
-    Instructs model to call format_final_json_response with its final answer.
-    """
-    user_tools = [
-        t for t in (tools or [])
-        if (t.get("function", t) if isinstance(t, dict) else t).get("name") != "format_final_json_response"
-    ]
-
-    tool_section = ""
-    if user_tools:
-        tool_section = build_tools_prompt(user_tools) + "\n\n"
-
-    return f"""{tool_section}When you have a final answer for the user, you MUST respond with ONLY this JSON format:
-{{"tool_call": {{"name": "format_final_json_response", "arguments": {{"output": "your answer here"}}}}}}
-
-Replace "your answer here" with your actual response. Do not add any text before or after this JSON."""
-
-def build_litertlm_messages(messages: list, tools: Optional[list] = None, n8n_mode: bool = False) -> tuple:
+def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tuple:
     """Convert OpenAI-style messages to litert_lm format."""
-    if n8n_mode:
-        tool_system = build_n8n_system_prompt(tools)
-    else:
-        tool_system = build_tools_prompt(tools) if tools else ""
-
     result = []
     system_content = ""
 
@@ -312,6 +252,7 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None, n8n_mo
             role = "user"
 
         if role == "assistant" and m.tool_calls:
+            # Convert tool_calls back to Gemma 4 format for history
             calls_text = []
             for tc in m.tool_calls:
                 fn = tc.get("function", {})
@@ -322,7 +263,9 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None, n8n_mo
                         args = json.loads(args)
                     except:
                         pass
-                calls_text.append(json.dumps({"tool_call": {"name": name, "arguments": args}}))
+                # Reconstruct Gemma 4 format
+                args_str = json.dumps(args)
+                calls_text.append(f'<|tool_call>call:{name}{args_str}<tool_call|>')
             text = "\n".join(calls_text) if calls_text else text
 
         if role == "system":
@@ -334,15 +277,11 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None, n8n_mo
             "content": [{"type": "text", "text": text}]
         })
 
-    final_system = system_content
-    if tool_system:
-        final_system = (system_content + "\n\n" + tool_system).strip() if system_content else tool_system
-
     init_messages = []
-    if final_system:
+    if system_content:
         init_messages.append({
             "role": "system",
-            "content": [{"type": "text", "text": final_system}]
+            "content": [{"type": "text", "text": system_content}]
         })
 
     if result:
@@ -395,10 +334,7 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # Detect n8n V3 Agent mode (it injects format_final_json_response)
-    n8n_mode = has_n8n_format_tool(req.tools)
-
-    init_messages, prompt_text = build_litertlm_messages(req.messages, req.tools, n8n_mode=n8n_mode)
+    init_messages, prompt_text = build_litertlm_messages(req.messages, req.tools)
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
@@ -415,24 +351,31 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # n8n mode: check if model called format_final_json_response
-    if n8n_mode:
-        final_output = extract_format_final_response(full_text)
-        if final_output:
-            log.info("n8n format_final_json_response detected — returning as text")
+    log.info(f"MODEL OUTPUT: {full_text[:300]}")
+
+    # Try Gemma 4 native tool call format first
+    if req.tools:
+        native_tool_calls = parse_gemma4_tool_calls(full_text)
+        if native_tool_calls:
+            log.info(f"Gemma 4 native tool calls detected: {[tc['function']['name'] for tc in native_tool_calls]}")
+            remaining_text = extract_text_without_tool_calls(full_text)
             return JSONResponse({
                 "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": final_output},
-                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": remaining_text or "",
+                        "tool_calls": native_tool_calls
+                    },
+                    "finish_reason": "tool_calls",
                 }],
                 "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
             })
 
-        # Check for user-defined tool call
-        tool_call = parse_tool_call(full_text)
-        if tool_call and tool_call["name"] != "format_final_json_response":
+        # Fallback: legacy JSON tool call format
+        legacy_tc = parse_tool_call_legacy(full_text)
+        if legacy_tc:
             tc_id = f"call_{uuid.uuid4().hex[:24]}"
             return JSONResponse({
                 "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
@@ -444,8 +387,8 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
                         "tool_calls": [{
                             "id": tc_id, "type": "function",
                             "function": {
-                                "name": tool_call["name"],
-                                "arguments": json.dumps(tool_call["arguments"])
+                                "name": legacy_tc["name"],
+                                "arguments": json.dumps(legacy_tc["arguments"])
                             }
                         }]
                     },
@@ -453,42 +396,6 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
                 }],
                 "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
             })
-
-        # Fallback: return raw text
-        return JSONResponse({
-            "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": full_text},
-                "finish_reason": "stop",
-            }],
-            "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
-        })
-
-    # Standard mode
-    tool_call = parse_tool_call(full_text) if req.tools else None
-
-    if tool_call:
-        tc_id = f"call_{uuid.uuid4().hex[:24]}"
-        return JSONResponse({
-            "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": tc_id, "type": "function",
-                        "function": {
-                            "name": tool_call["name"],
-                            "arguments": json.dumps(tool_call["arguments"])
-                        }
-                    }]
-                },
-                "finish_reason": "tool_calls",
-            }],
-            "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
-        })
 
     return JSONResponse({
         "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
@@ -582,22 +489,28 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    log.info(f"MODEL OUTPUT: {full_text[:200]}")
-    tool_call = parse_tool_call(full_text) if req.tools else None
+    log.info(f"MODEL OUTPUT (responses): {full_text[:300]}")
 
-    if tool_call:
-        call_id = f"call_{uuid.uuid4().hex[:24]}"
-        return JSONResponse({
-            "id": response_id, "object": "response", "created_at": created,
-            "status": "completed", "model": MODEL_ID,
-            "output": [{
-                "id": call_id, "type": "function_call", "status": "completed",
-                "call_id": call_id,
-                "name": tool_call["name"],
-                "arguments": json.dumps(tool_call["arguments"])
-            }],
-            "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
-        })
+    if req.tools:
+        native_tool_calls = parse_gemma4_tool_calls(full_text)
+        if native_tool_calls:
+            log.info(f"Gemma 4 native tool calls in responses: {[tc['function']['name'] for tc in native_tool_calls]}")
+            return JSONResponse({
+                "id": response_id, "object": "response", "created_at": created,
+                "status": "completed", "model": MODEL_ID,
+                "output": [
+                    {
+                        "id": tc["id"],
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"]
+                    }
+                    for tc in native_tool_calls
+                ],
+                "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
+            })
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     return JSONResponse({
