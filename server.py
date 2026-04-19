@@ -582,6 +582,7 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+    log.info(f"MODEL OUTPUT: {full_text[:200]}")
     tool_call = parse_tool_call(full_text) if req.tools else None
 
     if tool_call:
