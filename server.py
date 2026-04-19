@@ -5,7 +5,7 @@ Endpoints:
   GET  /health
   GET  /v1/models
   POST /v1/chat/completions  (classic OpenAI + tool calling)
-  POST /v1/responses         (new OpenAI Responses API - translates to chat/completions)
+  POST /v1/responses         (new OpenAI Responses API + tool calling)
 """
 
 import os
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
     log.info("Engine closed")
 
 # ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(title="Gemma 4 E2B API", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="Gemma 4 E2B API", version="3.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Auth ──────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ class Message(BaseModel):
     name: Optional[str] = None
 
 def _clean_tools(tools):
-    """Remove null 'strict' field n8n sends that breaks things."""
+    """Remove null 'strict' field n8n sends that breaks validation."""
     if not tools:
         return tools
     for tool in tools:
@@ -209,7 +209,7 @@ def parse_tool_call(text: str) -> Optional[dict]:
 
     return None
 
-def build_litertlm_messages(messages: list[Message], tools: Optional[list] = None) -> tuple[list[dict], str]:
+def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tuple:
     """Convert OpenAI-style messages to litert_lm format."""
     tool_system = build_tools_prompt(tools) if tools else ""
 
@@ -336,7 +336,7 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": None,
+                    "content": "",
                     "tool_calls": [{
                         "id": tc_id, "type": "function",
                         "function": {
@@ -402,14 +402,17 @@ async def chat_stream_generator(request_id, created, init_messages, prompt_text)
     yield f"data: {json.dumps(final)}\n\n"
     yield "data: [DONE]\n\n"
 
-# ── /v1/responses (translates to chat/completions) ───────────
+# ── /v1/responses ─────────────────────────────────────────────
 @app.post("/v1/responses")
 async def responses_endpoint(req: Request, _=Depends(verify_key)):
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     body = await req.json()
 
-    # Translate Responses API → Chat Completions API
+    # Build messages from input + instructions
     messages = []
-    if "instructions" in body and body["instructions"]:
+    if body.get("instructions"):
         messages.append(Message(role="system", content=body["instructions"]))
 
     input_data = body.get("input", "")
@@ -426,11 +429,52 @@ async def responses_endpoint(req: Request, _=Depends(verify_key)):
                     tool_call_id=item.get("tool_call_id"),
                 ))
 
-    chat_req = ChatRequest(
-        model=body.get("model", MODEL_ID),
-        messages=messages,
-        stream=body.get("stream", False),
-        tools=body.get("tools"),
-    )
+    tools = _clean_tools(body.get("tools"))
+    init_messages, prompt_text = build_litertlm_messages(messages, tools)
+    response_id = f"resp_{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
 
-    return await chat_completions(chat_req, None)
+    loop = asyncio.get_event_loop()
+    try:
+        full_text = await loop.run_in_executor(None, run_generation, init_messages, prompt_text)
+    except Exception as e:
+        log.error(f"Generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    tool_call = parse_tool_call(full_text) if tools else None
+
+    if tool_call:
+        call_id = f"call_{uuid.uuid4().hex[:24]}"
+        return JSONResponse({
+            "id": response_id,
+            "object": "response",
+            "created_at": created,
+            "status": "completed",
+            "model": MODEL_ID,
+            "output": [{
+                "id": call_id,
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": tool_call["name"],
+                "arguments": json.dumps(tool_call["arguments"])
+            }],
+            "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
+        })
+
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    return JSONResponse({
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "status": "completed",
+        "model": MODEL_ID,
+        "output": [{
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": full_text, "annotations": []}]
+        }],
+        "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
+    })
