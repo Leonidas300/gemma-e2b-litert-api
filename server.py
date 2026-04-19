@@ -4,13 +4,14 @@ server.py – OpenAI-compatible API for Gemma 4 E2B via LiteRT-LM Python API.
 Endpoints:
   GET  /health
   GET  /v1/models
-  POST /v1/chat/completions  (classic OpenAI + tool calling)
-  POST /v1/responses         (new OpenAI Responses API + tool calling)
+  POST /v1/chat/completions
+  POST /v1/responses
 
 Tool calling:
   Gemma 4 emits native tool calls using:
     <|tool_call>call:function_name{param:<|"|>value<|"|>}<tool_call|>
   We parse this format and convert to OpenAI tool_calls format.
+  Also handles n8n's non-standard tool format (no "function" wrapper).
 """
 
 import os
@@ -62,7 +63,7 @@ async def lifespan(app: FastAPI):
     log.info("Engine closed")
 
 # ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(title="Gemma 4 E2B API", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="Gemma 4 E2B API", version="5.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Auth ──────────────────────────────────────────────────────
@@ -97,45 +98,65 @@ class ResponsesRequest(BaseModel):
     instructions: Optional[str] = None
     tool_choice: Optional[Any] = None
 
+# ── Normalize tools ───────────────────────────────────────────
+def normalize_tools(tools: Optional[list]) -> Optional[list]:
+    """
+    Normalize tool format. n8n sends tools without "function" wrapper:
+      {"type": "function", "name": "...", "parameters": {...}}
+    OpenAI format has wrapper:
+      {"type": "function", "function": {"name": "...", "parameters": {...}}}
+    """
+    if not tools:
+        return None
+    normalized = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        # Skip n8n internal tools
+        if t.get("name") == "format_final_json_response":
+            continue
+        if t.get("function", {}).get("name") == "format_final_json_response":
+            continue
+        # n8n format: no "function" wrapper
+        if "name" in t and "function" not in t:
+            normalized.append({
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("parameters", {"type": "object", "properties": {}})
+                }
+            })
+        else:
+            normalized.append(t)
+    return normalized if normalized else None
+
 # ── Gemma 4 native tool call parser ──────────────────────────
 def parse_gemma4_tool_calls(text: str) -> Optional[list]:
     """
     Parse Gemma 4 native tool call format:
       <|tool_call>call:function_name{param:<|"|>value<|"|>}<tool_call|>
-    
-    Returns list of OpenAI-compatible tool_calls or None if no tool calls found.
     """
-    # Find all tool call blocks
     pattern = r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>'
     matches = re.findall(pattern, text, re.DOTALL)
-    
+
     if not matches:
         return None
-    
+
     tool_calls = []
     for func_name, args_str in matches:
-        # Parse arguments - Gemma 4 uses <|"|> for string escaping
-        # Replace Gemma's string escapes with proper quotes
         args_str = args_str.replace('<|"|>', '"')
-        
-        # Try to parse as JSON object
         try:
-            # Wrap in braces if needed
             if not args_str.strip().startswith('{'):
                 args_str = '{' + args_str + '}'
             arguments = json.loads(args_str)
         except json.JSONDecodeError:
-            # Try to parse key:value pairs manually
             arguments = {}
-            # Pattern: key:<|"|>value<|"|> or key:value
             kv_pattern = r'(\w+):"([^"]*)"'
-            kv_matches = re.findall(kv_pattern, args_str)
-            for k, v in kv_matches:
+            for k, v in re.findall(kv_pattern, args_str):
                 arguments[k] = v
-            # Also try numeric/boolean values
             kv_pattern2 = r'(\w+):([\d.]+|true|false|null)'
-            kv_matches2 = re.findall(kv_pattern2, args_str)
-            for k, v in kv_matches2:
+            for k, v in re.findall(kv_pattern2, args_str):
                 if v == 'true':
                     arguments[k] = True
                 elif v == 'false':
@@ -156,19 +177,17 @@ def parse_gemma4_tool_calls(text: str) -> Optional[list]:
                 "arguments": json.dumps(arguments)
             }
         })
-    
+
     return tool_calls if tool_calls else None
 
 def extract_text_without_tool_calls(text: str) -> str:
     """Remove Gemma 4 tool call blocks from text."""
     pattern = r'<\|tool_call>.*?<tool_call\|>'
-    cleaned = re.sub(pattern, '', text, flags=re.DOTALL).strip()
-    return cleaned
+    return re.sub(pattern, '', text, flags=re.DOTALL).strip()
 
 def parse_tool_call_legacy(text: str) -> Optional[dict]:
-    """Legacy JSON-based tool call parser (prompt engineering fallback)."""
+    """Legacy JSON-based tool call parser."""
     text = text.strip()
-
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "tool_call" in data:
@@ -178,13 +197,8 @@ def parse_tool_call_legacy(text: str) -> Optional[dict]:
     except json.JSONDecodeError:
         pass
 
-    json_patterns = [
-        r'```json\s*(\{.*?\})\s*```',
-        r'```\s*(\{.*?\})\s*```',
-    ]
-    for pattern in json_patterns:
-        matches = re.findall(pattern, text, re.DOTALL)
-        for match in matches:
+    for pattern in [r'```json\s*(\{.*?\})\s*```', r'```\s*(\{.*?\})\s*```']:
+        for match in re.findall(pattern, text, re.DOTALL):
             try:
                 data = json.loads(match)
                 if isinstance(data, dict) and "tool_call" in data:
@@ -203,9 +217,8 @@ def parse_tool_call_legacy(text: str) -> Optional[dict]:
             elif c == '}':
                 depth -= 1
                 if depth == 0:
-                    candidate = text[brace_start:i+1]
                     try:
-                        data = json.loads(candidate)
+                        data = json.loads(text[brace_start:i+1])
                         if isinstance(data, dict) and "tool_call" in data:
                             tc = data["tool_call"]
                             if "name" in tc:
@@ -219,7 +232,6 @@ def parse_tool_call_legacy(text: str) -> Optional[dict]:
 
 # ── Helpers ───────────────────────────────────────────────────
 def message_content_to_text(content: Any) -> str:
-    """Extract plain text from content field (string or list)."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -237,6 +249,35 @@ def message_content_to_text(content: Any) -> str:
         return " ".join(parts)
     return str(content)
 
+def build_tools_system_prompt(tools: list) -> str:
+    """Build system prompt describing available tools for Gemma 4."""
+    if not tools:
+        return ""
+
+    lines = ["You have access to the following tools:\n"]
+    for t in tools:
+        fn = t.get("function", t)
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        props = params.get("properties", {}) if isinstance(params, dict) else {}
+        required = params.get("required", []) if isinstance(params, dict) else []
+
+        lines.append(f"- {name}: {desc}")
+        for pname, pinfo in props.items():
+            ptype = pinfo.get("type", "any") if isinstance(pinfo, dict) else "any"
+            pdesc = pinfo.get("description", "") if isinstance(pinfo, dict) else ""
+            req = " (required)" if pname in required else ""
+            lines.append(f"    - {pname} ({ptype}){req}: {pdesc}")
+
+    lines.append("""
+When you need to call a tool, use this exact format:
+<|tool_call>call:tool_name{<|"|>param<|"|>:<|"|>value<|"|>}<tool_call|>
+
+If you don't need a tool, respond normally in plain text.""")
+
+    return "\n".join(lines)
+
 def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tuple:
     """Convert OpenAI-style messages to litert_lm format."""
     result = []
@@ -252,7 +293,6 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tup
             role = "user"
 
         if role == "assistant" and m.tool_calls:
-            # Convert tool_calls back to Gemma 4 format for history
             calls_text = []
             for tc in m.tool_calls:
                 fn = tc.get("function", {})
@@ -263,9 +303,8 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tup
                         args = json.loads(args)
                     except:
                         pass
-                # Reconstruct Gemma 4 format
-                args_str = json.dumps(args)
-                calls_text.append(f'<|tool_call>call:{name}{args_str}<tool_call|>')
+                args_gemma = json.dumps(args).replace('"', '<|"|>')
+                calls_text.append(f'<|tool_call>call:{name}{args_gemma}<tool_call|>')
             text = "\n".join(calls_text) if calls_text else text
 
         if role == "system":
@@ -276,6 +315,12 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tup
             "role": role,
             "content": [{"type": "text", "text": text}]
         })
+
+    # Add tools description to system prompt
+    if tools:
+        tools_prompt = build_tools_system_prompt(tools)
+        if tools_prompt:
+            system_content = (system_content + "\n\n" + tools_prompt).strip() if system_content else tools_prompt
 
     init_messages = []
     if system_content:
@@ -294,7 +339,6 @@ def build_litertlm_messages(messages: list, tools: Optional[list] = None) -> tup
     return init_messages, prompt_text
 
 def run_generation(init_messages: list, prompt_text: str) -> str:
-    """Run full generation, return complete response text."""
     full_text = ""
     with engine.create_conversation(messages=init_messages) as conv:
         for chunk in conv.send_message_async(prompt_text):
@@ -304,7 +348,6 @@ def run_generation(init_messages: list, prompt_text: str) -> str:
     return full_text
 
 def stream_generation(init_messages: list, prompt_text: str):
-    """Yield text tokens as they arrive."""
     with engine.create_conversation(messages=init_messages) as conv:
         for chunk in conv.send_message_async(prompt_text):
             for item in chunk.get("content", []):
@@ -318,14 +361,11 @@ def stream_generation(init_messages: list, prompt_text: str):
 def health():
     return {"status": "ok", "model": MODEL_ID, "engine_ready": engine is not None}
 
-# ── /v1/models ────────────────────────────────────────────────
 @app.get("/v1/models")
 def list_models(_=Depends(verify_key)):
     return {
         "object": "list",
-        "data": [{
-            "id": MODEL_ID, "object": "model", "created": 1700000000, "owned_by": "google",
-        }]
+        "data": [{"id": MODEL_ID, "object": "model", "created": 1700000000, "owned_by": "google"}]
     }
 
 # ── /v1/chat/completions ──────────────────────────────────────
@@ -334,11 +374,12 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    init_messages, prompt_text = build_litertlm_messages(req.messages, req.tools)
+    tools = normalize_tools(req.tools)
+    init_messages, prompt_text = build_litertlm_messages(req.messages, tools)
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    if req.stream and not req.tools:
+    if req.stream and not tools:
         return StreamingResponse(
             chat_stream_generator(request_id, created, init_messages, prompt_text),
             media_type="text/event-stream",
@@ -353,19 +394,17 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
 
     log.info(f"MODEL OUTPUT: {full_text[:300]}")
 
-    # Try Gemma 4 native tool call format first
-    if req.tools:
+    if tools:
         native_tool_calls = parse_gemma4_tool_calls(full_text)
         if native_tool_calls:
-            log.info(f"Gemma 4 native tool calls detected: {[tc['function']['name'] for tc in native_tool_calls]}")
-            remaining_text = extract_text_without_tool_calls(full_text)
+            log.info(f"Native tool calls: {[tc['function']['name'] for tc in native_tool_calls]}")
             return JSONResponse({
                 "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
                 "choices": [{
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": remaining_text or "",
+                        "content": extract_text_without_tool_calls(full_text) or "",
                         "tool_calls": native_tool_calls
                     },
                     "finish_reason": "tool_calls",
@@ -373,7 +412,6 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
                 "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
             })
 
-        # Fallback: legacy JSON tool call format
         legacy_tc = parse_tool_call_legacy(full_text)
         if legacy_tc:
             tc_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -386,10 +424,7 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
                         "content": "",
                         "tool_calls": [{
                             "id": tc_id, "type": "function",
-                            "function": {
-                                "name": legacy_tc["name"],
-                                "arguments": json.dumps(legacy_tc["arguments"])
-                            }
+                            "function": {"name": legacy_tc["name"], "arguments": json.dumps(legacy_tc["arguments"])}
                         }]
                     },
                     "finish_reason": "tool_calls",
@@ -408,7 +443,6 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
     })
 
 async def chat_stream_generator(request_id, created, init_messages, prompt_text):
-    """SSE stream in chat.completion.chunk format."""
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -423,11 +457,7 @@ async def chat_stream_generator(request_id, created, init_messages, prompt_text)
 
     loop.run_in_executor(None, producer)
 
-    first = {
-        "id": request_id, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-    }
-    yield f"data: {json.dumps(first)}\n\n"
+    yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
     while True:
         item = await queue.get()
@@ -436,17 +466,9 @@ async def chat_stream_generator(request_id, created, init_messages, prompt_text)
         if isinstance(item, dict) and "__error__" in item:
             yield f"data: {json.dumps({'error': {'message': item['__error__']}})}\n\n"
             return
-        chunk = {
-            "id": request_id, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID,
-            "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}]
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
+        yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {'content': item}, 'finish_reason': None}]})}\n\n"
 
-    final = {
-        "id": request_id, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-    }
-    yield f"data: {json.dumps(final)}\n\n"
+    yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
     yield "data: [DONE]\n\n"
 
 # ── /v1/responses ─────────────────────────────────────────────
@@ -472,11 +494,12 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
                     tool_call_id=item.get("tool_call_id"),
                 ))
 
-    init_messages, prompt_text = build_litertlm_messages(messages, req.tools)
+    tools = normalize_tools(req.tools)
+    init_messages, prompt_text = build_litertlm_messages(messages, tools)
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    if req.stream and not req.tools:
+    if req.stream and not tools:
         return StreamingResponse(
             responses_stream_generator(response_id, created, init_messages, prompt_text),
             media_type="text/event-stream",
@@ -488,28 +511,22 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
     except Exception as e:
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-      
-    log.info(f"TOOLS RECEIVED: {json.dumps(req.tools, default=str)[:300] if req.tools else 'NONE'}")
+
     log.info(f"MODEL OUTPUT (responses): {full_text[:300]}")
 
-    if req.tools:
+    if tools:
         native_tool_calls = parse_gemma4_tool_calls(full_text)
         if native_tool_calls:
-            log.info(f"Gemma 4 native tool calls in responses: {[tc['function']['name'] for tc in native_tool_calls]}")
+            log.info(f"Native tool calls in responses: {[tc['function']['name'] for tc in native_tool_calls]}")
             return JSONResponse({
                 "id": response_id, "object": "response", "created_at": created,
                 "status": "completed", "model": MODEL_ID,
-                "output": [
-                    {
-                        "id": tc["id"],
-                        "type": "function_call",
-                        "status": "completed",
-                        "call_id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "arguments": tc["function"]["arguments"]
-                    }
-                    for tc in native_tool_calls
-                ],
+                "output": [{
+                    "id": tc["id"], "type": "function_call", "status": "completed",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"]
+                } for tc in native_tool_calls],
                 "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
             })
 
@@ -525,7 +542,6 @@ async def responses_endpoint(req: ResponsesRequest, _=Depends(verify_key)):
     })
 
 async def responses_stream_generator(response_id, created, init_messages, prompt_text):
-    """SSE stream for Responses API."""
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -565,10 +581,8 @@ async def responses_stream_generator(response_id, created, init_messages, prompt
         "response": {
             "id": response_id, "object": "response", "created_at": created,
             "status": "completed", "model": MODEL_ID,
-            "output": [{
-                "id": msg_id, "type": "message", "role": "assistant", "status": "completed",
-                "content": [{"type": "output_text", "text": full_text, "annotations": []}]
-            }],
+            "output": [{"id": msg_id, "type": "message", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": full_text, "annotations": []}]}],
             "usage": {"input_tokens": -1, "output_tokens": -1, "total_tokens": -1}
         }
     }
