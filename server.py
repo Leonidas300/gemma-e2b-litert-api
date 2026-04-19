@@ -12,6 +12,10 @@ Tool calling strategy:
   JSON format when it wants to call a tool. The server parses this output
   and converts it into OpenAI's native tool_calls format so clients
   (n8n AI Agent, LangChain, etc.) can use it transparently.
+
+  Special handling for n8n V3 Agent's internal tool: format_final_json_response.
+  When the model calls this tool, we extract the output and return it as a
+  normal text response — n8n uses this tool to format final answers.
 """
 
 import os
@@ -63,7 +67,7 @@ async def lifespan(app: FastAPI):
     log.info("Engine closed")
 
 # ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(title="Gemma 4 E2B API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Gemma 4 E2B API", version="4.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Auth ──────────────────────────────────────────────────────
@@ -127,6 +131,9 @@ def build_tools_prompt(tools: list) -> str:
     for t in tools:
         fn = t.get("function", t) if isinstance(t, dict) else t
         name = fn.get("name", "unknown")
+        # Skip n8n internal tools from description
+        if name == "format_final_json_response":
+            continue
         desc = fn.get("description", "")
         params = fn.get("parameters", {})
         props = params.get("properties", {}) if isinstance(params, dict) else {}
@@ -141,6 +148,9 @@ def build_tools_prompt(tools: list) -> str:
 
         params_str = "\n".join(param_lines) if param_lines else "    (no parameters)"
         tool_descriptions.append(f"- {name}: {desc}\n  Parameters:\n{params_str}")
+
+    if not tool_descriptions:
+        return ""
 
     tools_text = "\n".join(tool_descriptions)
 
@@ -158,7 +168,6 @@ def parse_tool_call(text: str) -> Optional[dict]:
     """Try to parse a tool call from the model's raw output."""
     text = text.strip()
 
-    # Try direct JSON parse
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "tool_call" in data:
@@ -168,7 +177,6 @@ def parse_tool_call(text: str) -> Optional[dict]:
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON wrapped in code fences or inline
     json_patterns = [
         r'```json\s*(\{.*?\})\s*```',
         r'```\s*(\{.*?\})\s*```',
@@ -185,7 +193,6 @@ def parse_tool_call(text: str) -> Optional[dict]:
             except json.JSONDecodeError:
                 continue
 
-    # Last resort: look for any JSON object containing "tool_call"
     brace_start = text.find('{')
     while brace_start != -1:
         depth = 0
@@ -209,12 +216,88 @@ def parse_tool_call(text: str) -> Optional[dict]:
 
     return None
 
-def build_litertlm_messages(messages: list[Message], tools: Optional[list] = None) -> tuple[list[dict], str]:
+def extract_format_final_response(text: str) -> Optional[str]:
     """
-    Convert OpenAI-style messages to litert_lm format.
-    Returns (init_messages, last_prompt_text).
+    n8n V3 Agent adds 'format_final_json_response' tool internally.
+    When the model calls it, extract the 'output' field and return as plain text.
     """
-    tool_system = build_tools_prompt(tools) if tools else ""
+    text = text.strip()
+
+    # Try to find tool_call with name format_final_json_response
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "tool_call" in data:
+            tc = data["tool_call"]
+            if tc.get("name") == "format_final_json_response":
+                args = tc.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        pass
+                return args.get("output", str(args))
+    except json.JSONDecodeError:
+        pass
+
+    # Search in raw text
+    patterns = [
+        r'```json\s*(\{.*?\})\s*```',
+        r'```\s*(\{.*?\})\s*```',
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.DOTALL)
+        for match in matches:
+            try:
+                data = json.loads(match)
+                if isinstance(data, dict) and "tool_call" in data:
+                    tc = data["tool_call"]
+                    if tc.get("name") == "format_final_json_response":
+                        args = tc.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except:
+                                pass
+                        return args.get("output", str(args))
+            except json.JSONDecodeError:
+                continue
+
+    return None
+
+def has_n8n_format_tool(tools: Optional[list]) -> bool:
+    """Check if n8n injected its format_final_json_response tool."""
+    if not tools:
+        return False
+    return any(
+        (t.get("function", t) if isinstance(t, dict) else t).get("name") == "format_final_json_response"
+        for t in tools
+    )
+
+def build_n8n_system_prompt(tools: Optional[list]) -> str:
+    """
+    Build system prompt for n8n V3 Agent mode.
+    Instructs model to call format_final_json_response with its final answer.
+    """
+    user_tools = [
+        t for t in (tools or [])
+        if (t.get("function", t) if isinstance(t, dict) else t).get("name") != "format_final_json_response"
+    ]
+
+    tool_section = ""
+    if user_tools:
+        tool_section = build_tools_prompt(user_tools) + "\n\n"
+
+    return f"""{tool_section}When you have a final answer for the user, you MUST respond with ONLY this JSON format:
+{{"tool_call": {{"name": "format_final_json_response", "arguments": {{"output": "your answer here"}}}}}}
+
+Replace "your answer here" with your actual response. Do not add any text before or after this JSON."""
+
+def build_litertlm_messages(messages: list, tools: Optional[list] = None, n8n_mode: bool = False) -> tuple:
+    """Convert OpenAI-style messages to litert_lm format."""
+    if n8n_mode:
+        tool_system = build_n8n_system_prompt(tools)
+    else:
+        tool_system = build_tools_prompt(tools) if tools else ""
 
     result = []
     system_content = ""
@@ -223,13 +306,11 @@ def build_litertlm_messages(messages: list[Message], tools: Optional[list] = Non
         role = m.role
         text = message_content_to_text(m.content)
 
-        # Tool result → convert to user message
         if role == "tool":
             tool_name = m.name or "tool"
             text = f"[Tool result from {tool_name}]: {text}"
             role = "user"
 
-        # Assistant tool_calls → convert to JSON text (so model sees history)
         if role == "assistant" and m.tool_calls:
             calls_text = []
             for tc in m.tool_calls:
@@ -253,7 +334,6 @@ def build_litertlm_messages(messages: list[Message], tools: Optional[list] = Non
             "content": [{"type": "text", "text": text}]
         })
 
-    # Combine system content with tool instructions
     final_system = system_content
     if tool_system:
         final_system = (system_content + "\n\n" + tool_system).strip() if system_content else tool_system
@@ -265,7 +345,6 @@ def build_litertlm_messages(messages: list[Message], tools: Optional[list] = Non
             "content": [{"type": "text", "text": final_system}]
         })
 
-    # Last message becomes the prompt
     if result:
         init_messages.extend(result[:-1])
         last = result[-1]
@@ -316,11 +395,13 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    init_messages, prompt_text = build_litertlm_messages(req.messages, req.tools)
+    # Detect n8n V3 Agent mode (it injects format_final_json_response)
+    n8n_mode = has_n8n_format_tool(req.tools)
+
+    init_messages, prompt_text = build_litertlm_messages(req.messages, req.tools, n8n_mode=n8n_mode)
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    # Streaming disabled when tools are present (we need full output to parse)
     if req.stream and not req.tools:
         return StreamingResponse(
             chat_stream_generator(request_id, created, init_messages, prompt_text),
@@ -334,6 +415,57 @@ async def chat_completions(req: ChatRequest, _=Depends(verify_key)):
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+    # n8n mode: check if model called format_final_json_response
+    if n8n_mode:
+        final_output = extract_format_final_response(full_text)
+        if final_output:
+            log.info("n8n format_final_json_response detected — returning as text")
+            return JSONResponse({
+                "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": final_output},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
+            })
+
+        # Check for user-defined tool call
+        tool_call = parse_tool_call(full_text)
+        if tool_call and tool_call["name"] != "format_final_json_response":
+            tc_id = f"call_{uuid.uuid4().hex[:24]}"
+            return JSONResponse({
+                "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tc_id, "type": "function",
+                            "function": {
+                                "name": tool_call["name"],
+                                "arguments": json.dumps(tool_call["arguments"])
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
+            })
+
+        # Fallback: return raw text
+        return JSONResponse({
+            "id": request_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": full_text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1}
+        })
+
+    # Standard mode
     tool_call = parse_tool_call(full_text) if req.tools else None
 
     if tool_call:
